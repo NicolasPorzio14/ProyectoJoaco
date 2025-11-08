@@ -6,6 +6,7 @@ from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.memory import ConversationBufferMemory
+from langchain_core.prompts import SystemMessagePromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
 
 # --- 1. CONFIGURACIÓN INICIAL DEL FRONTEND ---
 
@@ -75,12 +76,35 @@ def process_document(api_key: str):
 # Función para inicializar la cadena RAG con memoria
 def get_conversation_chain(vectorstore):
     """
-    Crea y retorna la cadena de conversación con memoria.
+    Crea y retorna la cadena de conversación con memoria,
+    incluyendo el prompt del Contador Público Argentino.
     """
+    # 1. Definición del Prompt de Sistema (System Prompt)
+    system_prompt_text = (
+        "Eres TITI, un Contador Público Profesional de Argentina especializado en derecho tributario y asesoramiento impositivo. "
+        "Tu función es responder a las consultas del usuario basándote estricta y exclusivamente en el contexto que te proporciona el archivo 'IVA.pdf' (el contexto recuperado). "
+        "Utiliza un lenguaje formal, técnico y profesional, como corresponde a un experto en la materia. "
+        "Si la respuesta no se encuentra en el contexto proporcionado, debes responder: 'Lo siento, como Contador Impositivo, solo puedo responder basándome en la información del documento IVA.pdf, y no encontré esa información específica en él.' "
+        "No utilices conocimientos generales."
+    )
+    
+    # Template para el chat (incluye historial, prompt de sistema y pregunta humana)
+    custom_template = (
+        f"{system_prompt_text}\n\n"
+        "----------------\n"
+        "Chat History:\n"
+        "{chat_history}\n"
+        "----------------\n"
+        "Contexto del documento:\n"
+        "{context}\n"
+        "----------------\n"
+        "Pregunta del Usuario: {question}"
+    )
+
     # Inicializar el modelo de chat con la clave API
     llm = ChatOpenAI(
         model="gpt-3.5-turbo", 
-        temperature=0.7, 
+        temperature=0.2, # Bajamos la temperatura para respuestas más precisas y menos creativas
         openai_api_key=openai_api_key
     )
     
@@ -95,8 +119,13 @@ def get_conversation_chain(vectorstore):
         llm=llm,
         retriever=vectorstore.as_retriever(),
         memory=memory,
-        # Opcional: para que las respuestas sean en español
+        # Usamos 'stuff' para inyectar todo el contexto en el prompt.
         chain_type="stuff",
+        # Incluir el prompt personalizado
+        combine_docs_chain_kwargs={"prompt": ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(system_prompt_text),
+            HumanMessagePromptTemplate.from_template("Pregunta del Usuario: {question}")
+        ])},
         verbose=True
     )
     return conversation_chain
@@ -140,9 +169,15 @@ def handle_user_input(user_question):
         return
 
     # Llamar a la cadena de conversación RAG
-    response = st.session_state.conversation({'question': user_question})
+    # Usamos la sintaxis de invocación directamente:
+    try:
+        response = st.session_state.conversation.invoke({'question': user_question})
+    except Exception as e:
+        st.error(f"Error al obtener respuesta del LLM: {e}")
+        return
     
     # La memoria ya actualizó el historial internamente. Aquí lo extraemos y mostramos.
+    # El output de invoke es diferente a la sintaxis anterior, lo adaptamos:
     st.session_state.chat_history = response['chat_history']
 
 
@@ -153,7 +188,7 @@ user_question = st.chat_input("Pregunta algo sobre el archivo IVA.pdf...")
 
 if user_question and st.session_state.is_setup_done:
     # Añadir la pregunta del usuario al historial
-    st.session_state.chat_history.append(("user", user_question))
+    # Nota: LangChain maneja el historial, pero Streamlit necesita el estado de sesión para mostrarlo.
     
     # Generar y mostrar una respuesta (usamos una barra de progreso mientras responde)
     with st.spinner("TITI está pensando..."):
@@ -167,14 +202,12 @@ elif user_question and not st.session_state.is_setup_done:
 st.markdown("### 💬 Historial de Conversación")
 
 if st.session_state.chat_history:
-    # Mostrar el historial en orden inverso para que la última conversación esté abajo
-    for i, message in enumerate(reversed(st.session_state.chat_history)):
-        role, content = (message.type, message.content) if hasattr(message, 'type') else ('user' if i % 2 == 0 else 'assistant', message)
-        
-        # Usar los elementos nativos de chat de Streamlit
-        if role == 'user':
+    # Mostrar el historial en orden correcto
+    for message in st.session_state.chat_history:
+        # LangChain devuelve objetos Message, con type y content
+        if message.type == 'human':
             with st.chat_message("user"):
-                st.write(content)
+                st.write(message.content)
         else: # assistant
             with st.chat_message("assistant"):
-                st.write(content)
+                st.write(message.content)
