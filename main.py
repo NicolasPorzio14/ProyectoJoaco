@@ -1,124 +1,180 @@
 import streamlit as st
-from langchain import PromptTemplate
-from langchain_openai import OpenAI
+import os
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import FAISS
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.memory import ConversationBufferMemory
 
+# --- 1. CONFIGURACIÓN INICIAL DEL FRONTEND ---
 
-template = """
-    Below is a draft text that may be poorly worded.
-    Your goal is to:
-    - Properly redact the draft text
-    - Convert the draft text to a specified tone
-    - Convert the draft text to a specified dialect
+st.set_page_config(page_title="TITI-AYUDANTE IMPOSITIVO", layout="wide")
+st.header("TITI-AYUDANTE IMPOSITIVO 💰🤖")
 
-    Here are some examples different Tones:
-    - Formal: Greetings! OpenAI has announced that Sam Altman is rejoining the company as its Chief Executive Officer. After a period of five days of conversations, discussions, and deliberations, the decision to bring back Altman, who had been previously dismissed, has been made. We are delighted to welcome Sam back to OpenAI.
-    - Informal: Hey everyone, it's been a wild week! We've got some exciting news to share - Sam Altman is back at OpenAI, taking up the role of chief executive. After a bunch of intense talks, debates, and convincing, Altman is making his triumphant return to the AI startup he co-founded.  
-
-    Here are some examples of words in different dialects:
-    - American: French Fries, cotton candy, apartment, garbage, \
-        cookie, green thumb, parking lot, pants, windshield
-    - British: chips, candyfloss, flag, rubbish, biscuit, green fingers, \
-        car park, trousers, windscreen
-
-    Example Sentences from each dialect:
-    - American: Greetings! OpenAI has announced that Sam Altman is rejoining the company as its Chief Executive Officer. After a period of five days of conversations, discussions, and deliberations, the decision to bring back Altman, who had been previously dismissed, has been made. We are delighted to welcome Sam back to OpenAI.
-    - British: On Wednesday, OpenAI, the esteemed artificial intelligence start-up, announced that Sam Altman would be returning as its Chief Executive Officer. This decisive move follows five days of deliberation, discourse and persuasion, after Altman's abrupt departure from the company which he had co-established.
-
-    Please start the redaction with a warm introduction. Add the introduction \
-        if you need to.
-    
-    Below is the draft text, tone, and dialect:
-    DRAFT: {draft}
-    TONE: {tone}
-    DIALECT: {dialect}
-
-    YOUR {dialect} RESPONSE:
-"""
-
-#PromptTemplate variables definition
-prompt = PromptTemplate(
-    input_variables=["tone", "dialect", "draft"],
-    template=template,
-)
-
-
-#LLM and key loading function
-def load_LLM(openai_api_key):
-    """Logic for loading the chain you want to use should go here."""
-    # Make sure your openai_api_key is set as an environment variable
-    llm = OpenAI(temperature=.7, openai_api_key=openai_api_key)
-    return llm
-
-
-#Page title and header
-st.set_page_config(page_title="Re-write your text")
-st.header("Re-write your text")
-
-
-#Intro: instructions
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("Re-write your text in different styles.")
-
-with col2:
-    st.write("Contact with [AI Accelera](https://aiaccelera.com) to build your AI Projects")
-
-
-#Input OpenAI API Key
-st.markdown("## Enter Your OpenAI API Key")
+# --- 2. GESTIÓN DE LA CLAVE API Y LA LÓGICA DE BACKEND ---
 
 def get_openai_api_key():
-    input_text = st.text_input(label="OpenAI API Key ",  placeholder="Ex: sk-2twmA8tfCb8un4...", key="openai_api_key_input", type="password")
+    """Formulario para ingresar la clave API."""
+    with st.sidebar:
+        st.markdown("## 🔑 Clave OpenAI")
+        input_text = st.text_input(
+            label="OpenAI API Key",
+            placeholder="Ingresa tu clave sk-...",
+            type="password"
+        )
+        # Mostrar mensaje de advertencia si no se ingresa la clave
+        if not input_text:
+            st.warning("⚠️ Por favor, ingresa tu clave API para comenzar.")
+        
     return input_text
 
 openai_api_key = get_openai_api_key()
 
+# Ruta estática al archivo PDF
+PDF_PATH = os.path.join(os.path.dirname(__file__), "data", "IVA.pdf")
+# La base de datos vectorial se guarda en el mismo directorio que el script
+VECTOR_DB_PATH = "faiss_index_iva" 
 
-# Input
-st.markdown("## Enter the text you want to re-write")
-
-def get_draft():
-    draft_text = st.text_area(label="Text", label_visibility='collapsed', placeholder="Your Text...", key="draft_input")
-    return draft_text
-
-draft_input = get_draft()
-
-if len(draft_input.split(" ")) > 700:
-    st.write("Please enter a shorter text. The maximum length is 700 words.")
-    st.stop()
-
-# Prompt template tunning options
-col1, col2 = st.columns(2)
-with col1:
-    option_tone = st.selectbox(
-        'Which tone would you like your redaction to have?',
-        ('Formal', 'Informal'))
-    
-with col2:
-    option_dialect = st.selectbox(
-        'Which English Dialect would you like?',
-        ('American', 'British'))
-    
-    
-# Output
-st.markdown("### Your Re-written text:")
-
-if draft_input:
-    if not openai_api_key:
-        st.warning('Please insert OpenAI API Key. \
-            Instructions [here](https://help.openai.com/en/articles/4936850-where-do-i-find-my-secret-api-key)', 
-            icon="⚠️")
+# Función para cargar y procesar el documento
+@st.cache_resource
+def process_document(api_key: str):
+    """
+    Carga el PDF, aplica splits, embeddings y crea el Vector Store.
+    Esto solo se ejecuta una vez gracias a st.cache_resource.
+    """
+    if not os.path.exists(PDF_PATH):
+        st.error(f"¡ERROR! No se encontró el archivo en: {PDF_PATH}")
+        st.stop()
+        
+    try:
+        # Cargar documento
+        loader = PyPDFLoader(PDF_PATH)
+        documents = loader.load()
+        
+        # Aplicar splits
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, 
+            chunk_overlap=200,
+            length_function=len
+        )
+        texts = text_splitter.split_documents(documents)
+        
+        # Crear embeddings
+        embeddings = OpenAIEmbeddings(openai_api_key=api_key)
+        
+        # Crear la base de datos vectorial (Vector Store)
+        vectorstore = FAISS.from_documents(texts, embeddings)
+        
+        return vectorstore
+    except Exception as e:
+        st.error(f"Ocurrió un error al procesar el documento o crear embeddings: {e}")
         st.stop()
 
-    llm = load_LLM(openai_api_key=openai_api_key)
 
-    prompt_with_draft = prompt.format(
-        tone=option_tone, 
-        dialect=option_dialect, 
-        draft=draft_input
+# Función para inicializar la cadena RAG con memoria
+def get_conversation_chain(vectorstore):
+    """
+    Crea y retorna la cadena de conversación con memoria.
+    """
+    # Inicializar el modelo de chat con la clave API
+    llm = ChatOpenAI(
+        model="gpt-3.5-turbo", 
+        temperature=0.7, 
+        openai_api_key=openai_api_key
     )
+    
+    # Memoria para el chat
+    memory = ConversationBufferMemory(
+        memory_key='chat_history', 
+        return_messages=True
+    )
+    
+    # Crear la cadena RAG
+    conversation_chain = ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=vectorstore.as_retriever(),
+        memory=memory,
+        # Opcional: para que las respuestas sean en español
+        chain_type="stuff",
+        verbose=True
+    )
+    return conversation_chain
 
-    improved_redaction = llm(prompt_with_draft)
 
-    st.write(improved_redaction)
+# --- 3. LÓGICA DE CHAT Y ESTADO ---
+
+if "conversation" not in st.session_state:
+    st.session_state.conversation = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "is_setup_done" not in st.session_state:
+    st.session_state.is_setup_done = False
+
+
+def setup_backend():
+    """Función que inicia el backend (solo se llama una vez)."""
+    if openai_api_key:
+        with st.spinner("Procesando documentos y preparando el Ayudante Impositivo..."):
+            # 1. Procesar el documento (obtiene el vector store)
+            vectorstore = process_document(openai_api_key)
+            
+            # 2. Inicializar la cadena de conversación
+            st.session_state.conversation = get_conversation_chain(vectorstore)
+            
+            # Marcar como listo
+            st.session_state.is_setup_done = True
+        st.success("¡TITI-AYUDANTE IMPOSITIVO listo! Ya puedes preguntar.")
+
+if not st.session_state.is_setup_done and openai_api_key:
+    setup_backend()
+elif not openai_api_key:
+    # Mostrar mensaje si falta la clave, ya se maneja en get_openai_api_key, pero reforzamos
+    st.info("Ingresa tu clave API en la barra lateral para cargar los datos del IVA.")
+
+
+def handle_user_input(user_question):
+    """Maneja la pregunta del usuario, llama al RAG y actualiza el historial."""
+    if st.session_state.conversation is None:
+        st.error("El modelo aún no está configurado. Por favor, verifica tu clave API y espera la carga inicial.")
+        return
+
+    # Llamar a la cadena de conversación RAG
+    response = st.session_state.conversation({'question': user_question})
+    
+    # La memoria ya actualizó el historial internamente. Aquí lo extraemos y mostramos.
+    st.session_state.chat_history = response['chat_history']
+
+
+# --- 4. INTERFAZ DE CONVERSACIÓN ---
+
+# Input de la pregunta del usuario
+user_question = st.chat_input("Pregunta algo sobre el archivo IVA.pdf...")
+
+if user_question and st.session_state.is_setup_done:
+    # Añadir la pregunta del usuario al historial
+    st.session_state.chat_history.append(("user", user_question))
+    
+    # Generar y mostrar una respuesta (usamos una barra de progreso mientras responde)
+    with st.spinner("TITI está pensando..."):
+        handle_user_input(user_question)
+
+elif user_question and not st.session_state.is_setup_done:
+    st.warning("El Ayudante Impositivo no está listo. Verifica que la clave API esté ingresada y que el PDF se haya cargado correctamente.")
+
+
+# Mostrar historial de chat
+st.markdown("### 💬 Historial de Conversación")
+
+if st.session_state.chat_history:
+    # Mostrar el historial en orden inverso para que la última conversación esté abajo
+    for i, message in enumerate(reversed(st.session_state.chat_history)):
+        role, content = (message.type, message.content) if hasattr(message, 'type') else ('user' if i % 2 == 0 else 'assistant', message)
+        
+        # Usar los elementos nativos de chat de Streamlit
+        if role == 'user':
+            with st.chat_message("user"):
+                st.write(content)
+        else: # assistant
+            with st.chat_message("assistant"):
+                st.write(content)
