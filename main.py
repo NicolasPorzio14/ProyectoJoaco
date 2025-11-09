@@ -1,12 +1,13 @@
 import streamlit as st
 import os
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.chat_models import ChatOpenAI
 from langchain_community.vectorstores import FAISS
 from langchain.chains import ConversationalRetrievalChain
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.memory import ConversationBufferMemory
-from langchain_core.prompts import SystemMessagePromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
+from langchain.prompts import SystemMessagePromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
 
 # --- 1. CONFIGURACIÓN INICIAL DEL FRONTEND ---
 
@@ -103,7 +104,7 @@ def get_conversation_chain(vectorstore):
 
     # Inicializar el modelo de chat con la clave API
     llm = ChatOpenAI(
-        model="gpt-3.5-turbo", 
+        model_name="gpt-3.5-turbo",
         temperature=0.2, # Bajamos la temperatura para respuestas más precisas y menos creativas
         openai_api_key=openai_api_key
     )
