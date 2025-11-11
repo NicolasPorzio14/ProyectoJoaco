@@ -1,18 +1,35 @@
 import streamlit as st
 import os
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.chat_models import ChatOpenAI
+
+# --- Importaciones Corregidas para LangChain 0.2.x ---
+# LangChain Community
 from langchain_community.vectorstores import FAISS
-from langchain.chains import ConversationalRetrievalChain
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.memory import ConversationBufferMemory
-from langchain.prompts import SystemMessagePromptTemplate, ChatPromptTemplate, HumanMessagePromptTemplate
+
+# LangChain OpenAI
+from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+
+# LangChain Core/Base
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+# ... líneas anteriores
+from langchain_core.runnables.history import RunnableWithMessageHistory
+
+# Componentes LCEL para RAG
+# ¡CORRECCIÓN AQUÍ! Se usa el nombre del paquete modular instalado:
+from langchain_text_splitters import RecursiveCharacterTextSplitter 
+from langchain.chains.history_aware_retriever import create_history_aware_retriever
+from langchain.chains.retrieval import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain 
+from langchain.memory import StreamlitChatMessageHistory # Memoria específica para Streamlit
 
 # --- 1. CONFIGURACIÓN INICIAL DEL FRONTEND ---
 
 st.set_page_config(page_title="TITI-AYUDANTE IMPOSITIVO", layout="wide")
-st.header("TITI-AYUDANTE IMPOSITIVO 💰🤖")
+st.header("TITI-AYUDANTE IMPOSITIVO 💰🤖 (LangChain LCEL)")
 
 # --- 2. GESTIÓN DE LA CLAVE API Y LA LÓGICA DE BACKEND ---
 
@@ -25,25 +42,20 @@ def get_openai_api_key():
             placeholder="Ingresa tu clave sk-...",
             type="password"
         )
-        # Mostrar mensaje de advertencia si no se ingresa la clave
         if not input_text:
             st.warning("⚠️ Por favor, ingresa tu clave API para comenzar.")
-        
     return input_text
 
 openai_api_key = get_openai_api_key()
 
-# Ruta estática al archivo PDF
+# Asumiendo la estructura: script/data/IVA.pdf
 PDF_PATH = os.path.join(os.path.dirname(__file__), "data", "IVA.pdf")
-# La base de datos vectorial se guarda en el mismo directorio que el script
-VECTOR_DB_PATH = "faiss_index_iva" 
 
-# Función para cargar y procesar el documento
+# Función para cargar y procesar el documento (cacheada)
 @st.cache_resource
 def process_document(api_key: str):
     """
     Carga el PDF, aplica splits, embeddings y crea el Vector Store.
-    Esto solo se ejecuta una vez gracias a st.cache_resource.
     """
     if not os.path.exists(PDF_PATH):
         st.error(f"¡ERROR! No se encontró el archivo en: {PDF_PATH}")
@@ -54,7 +66,7 @@ def process_document(api_key: str):
         loader = PyPDFLoader(PDF_PATH)
         documents = loader.load()
         
-        # Aplicar splits
+        # Aplicar splits (Importación corregida a langchain.text_splitter)
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000, 
             chunk_overlap=200,
@@ -74,70 +86,90 @@ def process_document(api_key: str):
         st.stop()
 
 
-# Función para inicializar la cadena RAG con memoria
-def get_conversation_chain(vectorstore):
+# Función para inicializar la cadena RAG con memoria (¡Implementación LCEL!)
+@st.cache_resource(hash_funcs={FAISS: lambda _: None})
+def get_conversation_chain(vectorstore, api_key):
     """
-    Crea y retorna la cadena de conversación con memoria,
-    incluyendo el prompt del Contador Público Argentino.
+    Crea y retorna la cadena de conversación RAG usando LCEL.
     """
-    # 1. Definición del Prompt de Sistema (System Prompt)
-    system_prompt_text = (
+    
+    # 1. Definición del Prompt de Sistema
+    SYSTEM_PROMPT = (
         "Eres TITI, un Contador Público Profesional de Argentina especializado en derecho tributario y asesoramiento impositivo. "
-        "Tu función es responder a las consultas del usuario basándote estricta y exclusivamente en el contexto que te proporciona el archivo 'IVA.pdf' (el contexto recuperado). "
+        "Tu función es responder a las consultas del usuario basándote estricta y exclusivamente en el contexto proporcionado: {context}. "
         "Utiliza un lenguaje formal, técnico y profesional, como corresponde a un experto en la materia. "
         "Si la respuesta no se encuentra en el contexto proporcionado, debes responder: 'Lo siento, como Contador Impositivo, solo puedo responder basándome en la información del documento IVA.pdf, y no encontré esa información específica en él.' "
         "No utilices conocimientos generales."
     )
     
-    # Template para el chat (incluye historial, prompt de sistema y pregunta humana)
-    custom_template = (
-        f"{system_prompt_text}\n\n"
-        "----------------\n"
-        "Chat History:\n"
-        "{chat_history}\n"
-        "----------------\n"
-        "Contexto del documento:\n"
-        "{context}\n"
-        "----------------\n"
-        "Pregunta del Usuario: {question}"
-    )
-
-    # Inicializar el modelo de chat con la clave API
+    # 2. Inicializar el LLM
     llm = ChatOpenAI(
         model_name="gpt-3.5-turbo",
-        temperature=0.2, # Bajamos la temperatura para respuestas más precisas y menos creativas
-        openai_api_key=openai_api_key
+        temperature=0.2,
+        openai_api_key=api_key
     )
     
-    # Memoria para el chat
-    memory = ConversationBufferMemory(
-        memory_key='chat_history', 
-        return_messages=True
+    # --- Componente A: History-Aware Retriever (Reformula la pregunta con contexto) ---
+    
+    # Prompt para reformular la pregunta (necesario para historial)
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", 
+             "Dado el historial de chat y la última pregunta del usuario, "
+             "formula una pregunta independiente que pueda ser utilizada para la búsqueda en la base de datos vectorial."
+            ),
+            # La historia de chat será inyectada automáticamente por RunnableWithMessageHistory
+            ("human", "{input}"),
+        ]
     )
     
-    # Crear la cadena RAG
-    conversation_chain = ConversationalRetrievalChain.from_llm(
+    history_aware_retriever = create_history_aware_retriever(
         llm=llm,
         retriever=vectorstore.as_retriever(),
-        memory=memory,
-        # Usamos 'stuff' para inyectar todo el contexto en el prompt.
-        chain_type="stuff",
-        # Incluir el prompt personalizado
-        combine_docs_chain_kwargs={"prompt": ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(system_prompt_text),
-            HumanMessagePromptTemplate.from_template("Pregunta del Usuario: {question}")
-        ])},
-        verbose=True
+        prompt=contextualize_q_prompt,
     )
-    return conversation_chain
+    
+    # --- Componente B: Stuff Documents Chain (Responde con el contexto y rol) ---
+    
+    document_chain = create_stuff_documents_chain(
+        llm=llm,
+        prompt=ChatPromptTemplate.from_messages(
+            [
+                ("system", SYSTEM_PROMPT),
+                # El historial se maneja en el paso de recuperación (history_aware_retriever)
+                ("human", "{input}"),
+            ]
+        ),
+    )
+    
+    # --- Componente C: Retrieval Chain (Combina A y B) ---
+    
+    # Cadena RAG que usa el retriever que maneja el historial y la cadena de documentos
+    retrieval_chain = create_retrieval_chain(
+        history_aware_retriever,
+        document_chain,
+    )
+    
+    # --- Componente D: Memoria y Conversación Final ---
 
+    # Envolvemos la cadena RAG en un Runnable que maneja el historial con StreamlitChatMessageHistory
+    conversation_chain = RunnableWithMessageHistory(
+        retrieval_chain,
+        lambda session_id: st.session_state.chat_history, # Usa la memoria de Streamlit
+        input_messages_key="input",
+        history_messages_key="chat_history", # Clave para el historial dentro del prompt
+    )
+    
+    return conversation_chain
 
 # --- 3. LÓGICA DE CHAT Y ESTADO ---
 
+# Inicialización del estado de sesión
+if "chat_history" not in st.session_state:
+    # Usamos la clase StreamlitChatMessageHistory (de community) para gestionar la memoria
+    st.session_state.chat_history = StreamlitChatMessageHistory(key="chat_history") 
 if "conversation" not in st.session_state:
     st.session_state.conversation = None
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
 if "is_setup_done" not in st.session_state:
     st.session_state.is_setup_done = False
 
@@ -150,7 +182,7 @@ def setup_backend():
             vectorstore = process_document(openai_api_key)
             
             # 2. Inicializar la cadena de conversación
-            st.session_state.conversation = get_conversation_chain(vectorstore)
+            st.session_state.conversation = get_conversation_chain(vectorstore, openai_api_key)
             
             # Marcar como listo
             st.session_state.is_setup_done = True
@@ -159,56 +191,62 @@ def setup_backend():
 if not st.session_state.is_setup_done and openai_api_key:
     setup_backend()
 elif not openai_api_key:
-    # Mostrar mensaje si falta la clave, ya se maneja en get_openai_api_key, pero reforzamos
     st.info("Ingresa tu clave API en la barra lateral para cargar los datos del IVA.")
 
 
 def handle_user_input(user_question):
-    """Maneja la pregunta del usuario, llama al RAG y actualiza el historial."""
+    """Maneja la pregunta del usuario y llama al RAG."""
     if st.session_state.conversation is None:
-        st.error("El modelo aún no está configurado. Por favor, verifica tu clave API y espera la carga inicial.")
+        st.error("El modelo aún no está configurado.")
         return
 
-    # Llamar a la cadena de conversación RAG
-    # Usamos la sintaxis de invocación directamente:
-    try:
-        response = st.session_state.conversation.invoke({'question': user_question})
-    except Exception as e:
-        st.error(f"Error al obtener respuesta del LLM: {e}")
-        return
+    # Limpiamos el historial de Streamlit antes de la invocación para evitar duplicados
+    # y usamos la memoria gestionada por RunnableWithMessageHistory
     
-    # La memoria ya actualizó el historial internamente. Aquí lo extraemos y mostramos.
-    # El output de invoke es diferente a la sintaxis anterior, lo adaptamos:
-    st.session_state.chat_history = response['chat_history']
+    try:
+        # Llamar a la cadena de conversación RAG (LCEL)
+        # Session ID es necesario para el RunnableWithMessageHistory, usamos un placeholder.
+        response = st.session_state.conversation.invoke(
+            {'input': user_question},
+            config={'configurable': {'session_id': 'unique_user_session'}}
+        )
+        # La respuesta ya se añade automáticamente al historial de Streamlit por la memoria
+        return response['answer']
+        
+    except Exception as e:
+        st.error(f"Error al obtener respuesta del LLM: {e}") 
+        return None
 
 
 # --- 4. INTERFAZ DE CONVERSACIÓN ---
+
+# Mostrar historial de chat (usamos el API de chat nativo de Streamlit)
+
+# Muestra el historial desde la memoria de Streamlit
+for message in st.session_state.chat_history.messages:
+    if isinstance(message, HumanMessage):
+        with st.chat_message("user"):
+            st.markdown(message.content)
+    elif isinstance(message, AIMessage):
+        with st.chat_message("assistant"):
+            st.markdown(message.content)
 
 # Input de la pregunta del usuario
 user_question = st.chat_input("Pregunta algo sobre el archivo IVA.pdf...")
 
 if user_question and st.session_state.is_setup_done:
-    # Añadir la pregunta del usuario al historial
-    # Nota: LangChain maneja el historial, pero Streamlit necesita el estado de sesión para mostrarlo.
     
-    # Generar y mostrar una respuesta (usamos una barra de progreso mientras responde)
+    # Mostrar la pregunta del usuario en el chat
+    with st.chat_message("user"):
+        st.markdown(user_question)
+
+    # Generar y mostrar una respuesta
     with st.spinner("TITI está pensando..."):
-        handle_user_input(user_question)
+        ai_response_content = handle_user_input(user_question)
+
+    if ai_response_content:
+        with st.chat_message("assistant"):
+            st.markdown(ai_response_content)
 
 elif user_question and not st.session_state.is_setup_done:
-    st.warning("El Ayudante Impositivo no está listo. Verifica que la clave API esté ingresada y que el PDF se haya cargado correctamente.")
-
-
-# Mostrar historial de chat
-st.markdown("### 💬 Historial de Conversación")
-
-if st.session_state.chat_history:
-    # Mostrar el historial en orden correcto
-    for message in st.session_state.chat_history:
-        # LangChain devuelve objetos Message, con type y content
-        if message.type == 'human':
-            with st.chat_message("user"):
-                st.write(message.content)
-        else: # assistant
-            with st.chat_message("assistant"):
-                st.write(message.content)
+    st.warning("El Ayudante Impositivo no está listo. Verifica la clave API.")
