@@ -1,25 +1,25 @@
 import streamlit as st
 import os
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFLoader
 
-from langchain.memory import ConversationBufferMemory  # (seguimos usando para conveniencia en UI)
+# --- LangChain moderno / ecosistema ---
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
 
-# NUEVO: cadenas RAG de la API moderna de LangChain
 from langchain.chains import create_history_aware_retriever, create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 
-# --- 1. CONFIGURACIÓN INICIAL DEL FRONTEND ---
 
+# --- 1. UI ---
 st.set_page_config(page_title="TITI-AYUDANTE IMPOSITIVO", layout="wide")
 st.header("TITI-AYUDANTE IMPOSITIVO 💰🤖")
 
-# --- 2. GESTIÓN DE LA CLAVE API Y LA LÓGICA DE BACKEND ---
 
+# --- 2. API Key ---
 def get_openai_api_key():
     """Formulario para ingresar la clave API."""
     with st.sidebar:
@@ -35,16 +35,17 @@ def get_openai_api_key():
 
 openai_api_key = get_openai_api_key()
 
-# Ruta estática al archivo PDF
-PDF_PATH = os.path.join(os.path.dirname(__file__), "data", "IVA.pdf")  # corregido __file__
-# La base de datos vectorial se guarda en el mismo directorio que el script
-VECTOR_DB_PATH = "faiss_index_iva"
 
-# Función para cargar y procesar el documento
+# --- 3. Rutas / paths ---
+PDF_PATH = os.path.join(os.path.dirname(__file__), "data", "IVA.pdf")
+VECTOR_DB_PATH = "faiss_index_iva"  # opcional si querés persistir
+
+
+# --- 4. Carga y vectorización del PDF ---
 @st.cache_resource
 def process_document(api_key: str):
     """
-    Carga el PDF, aplica splits, embeddings y crea/recupera el Vector Store.
+    Carga el PDF, lo parte en chunks, genera embeddings y crea el Vector Store (FAISS).
     """
     if not os.path.exists(PDF_PATH):
         st.error(f"¡ERROR! No se encontró el archivo en: {PDF_PATH}")
@@ -55,7 +56,7 @@ def process_document(api_key: str):
         loader = PyPDFLoader(PDF_PATH)
         documents = loader.load()
 
-        # Aplicar splits
+        # Partir en chunks
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200,
@@ -63,11 +64,16 @@ def process_document(api_key: str):
         )
         texts = text_splitter.split_documents(documents)
 
-        # Crear embeddings
+        # Embeddings
         embeddings = OpenAIEmbeddings(api_key=api_key)
+        # Si preferís especificar modelo de embeddings:
+        # embeddings = OpenAIEmbeddings(model="text-embedding-3-small", api_key=api_key)
 
-        # Si querés persistir, podrías usar FAISS.save_local / load_local
+        # Vector store
         vectorstore = FAISS.from_documents(texts, embeddings)
+
+        # (Opcional) persistencia:
+        # vectorstore.save_local(VECTOR_DB_PATH)
 
         return vectorstore
     except Exception as e:
@@ -75,12 +81,10 @@ def process_document(api_key: str):
         st.stop()
 
 
-# --- 2.b PROMPTS Y CADENAS RAG MODERNAS ---
-
+# --- 5. Construcción de la cadena RAG moderna ---
 def build_rag_chain(vectorstore, api_key: str):
     """
-    Crea un retriever con consciencia de historial y una cadena RAG moderna:
-    history-aware retriever + stuff documents chain + retrieval chain.
+    Arma: history-aware retriever + stuff documents chain + retrieval chain.
     """
     system_prompt_text = (
         "Eres TITI, un Contador Público Profesional de Argentina especializado en derecho tributario y asesoramiento impositivo. "
@@ -91,9 +95,9 @@ def build_rag_chain(vectorstore, api_key: str):
         "No utilices conocimientos generales."
     )
 
-    # Modelo
+    # Modelo de chat
     llm = ChatOpenAI(
-        model="gpt-3.5-turbo",
+        model="gpt-3.5-turbo",  # puedes cambiar a "gpt-4o-mini" si lo preferís
         temperature=0.2,
         api_key=api_key
     )
@@ -101,7 +105,7 @@ def build_rag_chain(vectorstore, api_key: str):
     # Retriever base
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    # Prompt para reescritura de consulta según historial (query rewriter)
+    # Prompt para reescritura de la consulta (contextualización con historial)
     contextualize_q_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "Dada la conversación previa y la última pregunta del usuario, reescribe la pregunta para que sea una consulta autónoma y clara. "
@@ -129,13 +133,13 @@ def build_rag_chain(vectorstore, api_key: str):
          "Pregunta del Usuario: {input}")
     ])
 
-    # Cadena para combinar documentos (stuff) y generar la respuesta
+    # Cadena que combina documentos + prompt (stuff)
     document_chain = create_stuff_documents_chain(
         llm=llm,
         prompt=answer_prompt
     )
 
-    # Cadena RAG final: (history-aware retriever) -> (document_chain)
+    # Cadena RAG final
     rag_chain = create_retrieval_chain(
         history_aware_retriever,
         document_chain
@@ -143,17 +147,17 @@ def build_rag_chain(vectorstore, api_key: str):
     return rag_chain
 
 
-# --- 3. LÓGICA DE CHAT Y ESTADO ---
-
+# --- 6. Estado de la app ---
 if "rag_chain" not in st.session_state:
     st.session_state.rag_chain = None
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # lista de LangChain Messages
+    st.session_state.chat_history = []  # lista de HumanMessage/AIMessage
 if "is_setup_done" not in st.session_state:
     st.session_state.is_setup_done = False
 
+
 def setup_backend():
-    """Función que inicia el backend (solo se llama una vez)."""
+    """Inicializa vectorstore + cadena RAG una sola vez."""
     if openai_api_key:
         with st.spinner("Procesando documentos y preparando el Ayudante Impositivo..."):
             vectorstore = process_document(openai_api_key)
@@ -166,30 +170,30 @@ if not st.session_state.is_setup_done and openai_api_key:
 elif not openai_api_key:
     st.info("Ingresa tu clave API en la barra lateral para cargar los datos del IVA.")
 
+
+# --- 7. Interacción de chat ---
 def handle_user_input(user_question: str):
-    """Maneja la pregunta del usuario usando la cadena RAG moderna."""
+    """Ejecuta la cadena RAG con historial y muestra la respuesta."""
     if st.session_state.rag_chain is None:
-        st.error("El modelo aún no está configurado. Por favor, verifica tu clave API y espera la carga inicial.")
+        st.error("El modelo aún no está configurado. Verifica la clave API y la carga inicial.")
         return
 
     try:
-        # invocamos pasando el historial y la entrada actual
         result = st.session_state.rag_chain.invoke({
             "input": user_question,
             "chat_history": st.session_state.chat_history
         })
         answer = result.get("answer", "")
 
-        # Actualizamos historial (LangChain Messages)
+        # Actualizar historial de conversación
         st.session_state.chat_history.append(HumanMessage(content=user_question))
         st.session_state.chat_history.append(AIMessage(content=answer))
 
     except Exception as e:
         st.error(f"Error al obtener respuesta del LLM: {e}")
-        return
 
-# --- 4. INTERFAZ DE CONVERSACIÓN ---
 
+# --- 8. UI de entrada y render del historial ---
 user_question = st.chat_input("Pregunta algo sobre el archivo IVA.pdf...")
 
 if user_question and st.session_state.is_setup_done:
@@ -198,11 +202,8 @@ if user_question and st.session_state.is_setup_done:
 elif user_question and not st.session_state.is_setup_done:
     st.warning("El Ayudante Impositivo no está listo. Verifica que la clave API esté ingresada y que el PDF se haya cargado correctamente.")
 
-# Mostrar historial de chat
 st.markdown("### 💬 Historial de Conversación")
-
 if st.session_state.chat_history:
-    # Render simple según tipo de mensaje
     for message in st.session_state.chat_history:
         if isinstance(message, HumanMessage):
             with st.chat_message("user"):
